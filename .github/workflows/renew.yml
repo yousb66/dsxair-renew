@@ -1,0 +1,93 @@
+name: DSX Air Simulation Renew
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # 每天 UTC 02:00 (北京 10:00)
+  workflow_dispatch:
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    env:
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+      TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+      TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Renew all simulations
+        run: |
+          API="https://api.dsx-air.nvidia.com/api/v3/simulations"
+          NOW_TS=$(date -u +%s)
+          NOW=$(date -u -d "@$NOW_TS" +%Y-%m-%dT%H:%M:%SZ)
+          CAP_TS=$((NOW_TS + 68*3600))
+          echo "now: $NOW"
+          TOTAL=0; OK=0; SKIP=0; FAIL=0; DETAILS=""
+          SIMS=$(curl -s -m 30 -H "Authorization: Bearer $NGC_API_KEY" "$API/" | jq -c '.results[]?')
+          if [ -z "$SIMS" ]; then
+            echo "no simulations returned (check API key)"
+            echo "TOTAL=0" >> $GITHUB_ENV; echo "OK_COUNT=0" >> $GITHUB_ENV
+            echo "SKIP_COUNT=0" >> $GITHUB_ENV; echo "FAIL_COUNT=1" >> $GITHUB_ENV
+            printf 'failed to list simulations\n' > details.txt
+            exit 0
+          fi
+          while IFS= read -r sim; do
+            TOTAL=$((TOTAL+1))
+            SID=$(echo "$sim" | jq -r '.id')
+            SNAME=$(echo "$sim" | jq -r '.name')
+            STATE=$(echo "$sim" | jq -r '.state')
+            EXP=$(echo "$sim" | jq -r '.expires_at')
+            if [ "$EXP" = "null" ] || [ -z "$EXP" ]; then
+              SKIP=$((SKIP+1))
+              DETAILS="${DETAILS}- ${SNAME} [${STATE}] expires_at=null no renewal needed\n"
+              continue
+            fi
+            EXP_TS=$(date -u -d "$EXP" +%s)
+            if [ "$EXP_TS" -gt "$NOW_TS" ]; then BASE_TS=$EXP_TS; else BASE_TS=$NOW_TS; fi
+            NEW_TS=$(( BASE_TS + 24*3600 ))
+            if [ "$NEW_TS" -gt "$CAP_TS" ]; then NEW_TS=$CAP_TS; fi
+            NEW=$(date -u -d "@$NEW_TS" +%Y-%m-%dT%H:%M:%SZ)
+            RESULT=$(curl -s -m 30 -w "|%{http_code}" -X PATCH "$API/$SID/" \
+              -H "Authorization: Bearer $NGC_API_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"expires_at\": \"$NEW\"}")
+            CODE="${RESULT##*|}"
+            if [ "$CODE" = "200" ]; then
+              OK=$((OK+1))
+              OLD_HUMAN=$(TZ=Asia/Shanghai date -d "$EXP" "+%m-%d %H:%M")
+              NEW_HUMAN=$(TZ=Asia/Shanghai date -d "$NEW" "+%m-%d %H:%M")
+              DETAILS="${DETAILS}OK ${SNAME} [${STATE}] ${OLD_HUMAN} -> ${NEW_HUMAN} UTC+8\n"
+            else
+              FAIL=$((FAIL+1))
+              DETAILS="${DETAILS}FAIL ${SNAME} [${STATE}] HTTP ${CODE}\n"
+            fi
+          done <<< "$SIMS"
+          echo "TOTAL=$TOTAL" >> $GITHUB_ENV
+          echo "OK_COUNT=$OK" >> $GITHUB_ENV
+          echo "SKIP_COUNT=$SKIP" >> $GITHUB_ENV
+          echo "FAIL_COUNT=$FAIL" >> $GITHUB_ENV
+          printf '%b' "$DETAILS" > details.txt
+
+      - name: Send Telegram notification
+        if: always()
+        run: |
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "TG secrets not set, skip notify"
+            exit 0
+          fi
+          if [ "${FAIL_COUNT:-0}" -eq 0 ]; then
+            HEAD="DSX Air renew OK"
+          elif [ "${OK_COUNT:-0}" -eq 0 ]; then
+            HEAD="DSX Air renew FAILED"
+          else
+            HEAD="DSX Air renew PARTIAL"
+          fi
+          SUMMARY="total ${TOTAL:-0} renewed ${OK_COUNT:-0} skip ${SKIP_COUNT:-0} fail ${FAIL_COUNT:-0}"
+          RUNINFO="run ${{ github.run_number }}"
+          MSG="${HEAD} ${SUMMARY} $(cat details.txt) ${RUNINFO}"
+          curl -s -m 30 -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" \
+            --data-urlencode "disable_web_page_preview=true"
+          echo
