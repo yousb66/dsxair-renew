@@ -21,7 +21,7 @@ jobs:
           API="https://api.dsx-air.nvidia.com/api/v3/simulations"
           NOW_TS=$(date -u +%s)
           NOW=$(date -u -d "@$NOW_TS" +%Y-%m-%dT%H:%M:%SZ)
-          CAP_TS=$((NOW_TS + 68*3600))
+          TOP_TS=$((NOW_TS + 71*3600))
           echo "now: $NOW"
           TOTAL=0; OK=0; SKIP=0; FAIL=0; DETAILS=""
           SIMS=$(curl -s -m 30 -H "Authorization: Bearer $NGC_API_KEY" "$API/" | jq -c '.results[]?')
@@ -37,21 +37,13 @@ jobs:
             SID=$(echo "$sim" | jq -r '.id')
             SNAME=$(echo "$sim" | jq -r '.name')
             STATE=$(echo "$sim" | jq -r '.state')
-            EXP=$(echo "$sim" | jq -r '.expires_at')
-            if [ "$EXP" = "null" ] || [ -z "$EXP" ]; then
-              SKIP=$((SKIP+1))
-              DETAILS="${DETAILS}- ${SNAME} [${STATE}] expires_at=null no renewal needed\n"
-              continue
-            fi
-            EXP_TS=$(date -u -d "$EXP" +%s)
-            if [ "$EXP_TS" -gt "$NOW_TS" ]; then BASE_TS=$EXP_TS; else BASE_TS=$NOW_TS; fi
-            NEW_TS=$(( BASE_TS + 24*3600 ))
-            if [ "$NEW_TS" -gt "$CAP_TS" ]; then NEW_TS=$CAP_TS; fi
+            EXP=$(echo "$sim" | jq -r '.sleep_at')
+            NEW_TS=$TOP_TS
             NEW=$(date -u -d "@$NEW_TS" +%Y-%m-%dT%H:%M:%SZ)
             RESULT=$(curl -s -m 30 -w "|%{http_code}" -X PATCH "$API/$SID/" \
               -H "Authorization: Bearer $NGC_API_KEY" \
               -H "Content-Type: application/json" \
-              -d "{\"expires_at\": \"$NEW\"}")
+              -d "{\"sleep_at\": \"$NEW\", \"expires_at\": \"$NEW\"}")
             CODE="${RESULT##*|}"
             if [ "$CODE" = "200" ]; then
               OK=$((OK+1))
@@ -77,7 +69,7 @@ jobs:
             exit 0
           fi
           if [ "${FAIL_COUNT:-0}" -eq 0 ]; then
-            HEAD="DSX Air renew OK"
+            HEAD="DSX Air renew OK topped to 71h"
           elif [ "${OK_COUNT:-0}" -eq 0 ]; then
             HEAD="DSX Air renew FAILED"
           else
